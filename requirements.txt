@@ -1,5 +1,6 @@
 pyaudio
 SpeechRecognition
+# PyTorch – remove the index URL below if you want CPU-only or a different CUDA version
 --extra-index-url https://download.pytorch.org/whl/cu116
 torch
 faster-whisper
