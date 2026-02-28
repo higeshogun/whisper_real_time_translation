@@ -128,8 +128,8 @@ async def index():
 # ── Client-mic: per-connection audio processing ───────────────────────────────
 
 # How many bytes of 16kHz/16-bit mono PCM to accumulate before processing:
-# 16000 Hz × 2 bytes × 3 seconds = 96 000 bytes
-_CLIENT_CHUNK_BYTES = 96_000
+# 16000 Hz × 2 bytes × 1.5 seconds = 48 000 bytes
+_CLIENT_CHUNK_BYTES = 48_000
 
 
 async def _process_client_pcm(
@@ -150,6 +150,8 @@ async def _process_client_pcm(
             segs, _ = _model.transcribe(
                 tmp.name,
                 language=_args.source_lang,
+                beam_size=_args.beam_size,
+                condition_on_previous_text=False,
                 vad_filter=True,
                 vad_parameters={"min_silence_duration_ms": 300},
             )
@@ -320,6 +322,8 @@ def _audio_loop(args: argparse.Namespace, source, model: WhisperModel) -> None:
             segments, _ = model.transcribe(
                 temp_file,
                 language=args.source_lang,
+                beam_size=args.beam_size,
+                condition_on_previous_text=False,
                 vad_filter=True,
                 vad_parameters={"min_silence_duration_ms": 500},
             )
@@ -407,7 +411,11 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--model", default="medium",
                    choices=["tiny", "base", "small", "medium", "large"],
-                   help="Whisper model size (default: medium)")
+                   help="Whisper model size (default: medium). "
+                        "Try 'small' for a good speed/accuracy trade-off.")
+    p.add_argument("--beam_size", default=1, type=int,
+                   help="Beam search width. 1 = greedy (fastest, default). "
+                        "5 = more accurate but ~2–3× slower.")
     p.add_argument("--device", default="auto",
                    choices=["auto", "cuda", "cpu"])
     p.add_argument("--compute_type", default="auto",
