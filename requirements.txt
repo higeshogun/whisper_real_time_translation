@@ -1,3 +1,4 @@
+# Only needed for server-side audio capture (not required for --no_server_audio mode)
 pyaudio
 SpeechRecognition
 # PyTorch – remove the index URL below if you want CPU-only or a different CUDA version

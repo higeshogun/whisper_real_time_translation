@@ -53,7 +53,6 @@ from tempfile import NamedTemporaryFile
 from time import sleep
 
 import nltk
-import speech_recognition as sr
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse
 from faster_whisper import WhisperModel
@@ -267,13 +266,13 @@ async def _broadcast_loop():
 
 # ── Server-audio capture thread ───────────────────────────────────────────────
 
-def _audio_loop(args: argparse.Namespace, source: sr.Microphone,
-                model: WhisperModel) -> None:
+def _audio_loop(args: argparse.Namespace, source, model: WhisperModel) -> None:
     """
     Continuously capture audio, transcribe with Faster-Whisper (forced to
     Japanese), and put the latest sentence into _caption_queue for the async
     broadcast loop to pick up.
     """
+    import speech_recognition as sr
     recorder = sr.Recognizer()
     recorder.energy_threshold         = args.energy_threshold
     recorder.dynamic_energy_threshold = False
@@ -455,6 +454,7 @@ def main() -> None:
     # ── Audio source ──────────────────────────────────────────────────────────
     source = None
     if not args.no_server_audio:
+        import speech_recognition as sr
         if "linux" in platform:
             if args.audio_source == "list":
                 print("Available audio devices:\n")
