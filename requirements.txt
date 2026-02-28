@@ -7,3 +7,6 @@ faster-whisper
 translatepy
 tk
 nltk
+# Web server (server.py)
+fastapi
+uvicorn[standard]

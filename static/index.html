@@ -1,0 +1,287 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+  <meta name="theme-color" content="#0a0a0a" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <title>Live Captions · JA→EN</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    :root {
+      --accent: #FFE066;
+      --bg: #0a0a0a;
+      --surface: #161616;
+      --border: #2a2a2a;
+      --text-dim: #555;
+    }
+
+    html, body {
+      height: 100%;
+      background: var(--bg);
+      color: #fff;
+      /* Japanese + Latin fallback stack */
+      font-family: 'Hiragino Sans', 'Yu Gothic', 'Noto Sans CJK JP',
+                   'Noto Sans JP', system-ui, sans-serif;
+      -webkit-font-smoothing: antialiased;
+      overscroll-behavior: none;
+    }
+
+    body {
+      display: flex;
+      flex-direction: column;
+      height: 100dvh; /* dynamic viewport height – respects mobile browser chrome */
+    }
+
+    /* ── Header ─────────────────────────────────────────────────────────── */
+    header {
+      flex-shrink: 0;
+      background: var(--surface);
+      border-bottom: 1px solid var(--border);
+      padding: 12px 16px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+    }
+
+    header h1 {
+      font-size: 0.95rem;
+      font-weight: 600;
+      color: #ccc;
+      letter-spacing: 0.04em;
+      white-space: nowrap;
+    }
+
+    #status {
+      display: flex;
+      align-items: center;
+      gap: 7px;
+      font-size: 0.75rem;
+      color: var(--text-dim);
+      white-space: nowrap;
+    }
+
+    #dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: var(--text-dim);
+      flex-shrink: 0;
+      transition: background 0.3s;
+    }
+    #dot.ok    { background: #4caf50; }
+    #dot.error { background: #f44336; }
+
+    /* ── Caption history (scrollable middle area) ────────────────────────── */
+    #history {
+      flex: 1;
+      overflow-y: auto;
+      -webkit-overflow-scrolling: touch;
+      padding: 14px 16px;
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+    }
+
+    .empty-msg {
+      margin: auto;
+      color: var(--text-dim);
+      font-size: 0.9rem;
+      text-align: center;
+    }
+
+    .card {
+      background: var(--surface);
+      border-radius: 12px;
+      padding: 12px 15px;
+      border-left: 3px solid var(--border);
+      opacity: 0.55;
+      transition: opacity 0.4s, border-color 0.4s;
+    }
+
+    .card.latest {
+      opacity: 1;
+      border-left-color: var(--accent);
+    }
+
+    .card-ja {
+      font-size: clamp(1rem, 3.5vw, 1.25rem);
+      line-height: 1.65;
+      color: #fff;
+      margin-bottom: 5px;
+    }
+
+    .card-en {
+      font-size: clamp(0.9rem, 3vw, 1.1rem);
+      line-height: 1.55;
+      color: var(--accent);
+    }
+
+    /* ── Live subtitle bar (pinned to bottom) ────────────────────────────── */
+    #live-bar {
+      flex-shrink: 0;
+      background: rgba(0, 0, 0, 0.93);
+      border-top: 2px solid var(--accent);
+      padding: clamp(14px, 3vw, 22px) clamp(16px, 5vw, 40px);
+      padding-bottom: max(clamp(14px, 3vw, 22px), env(safe-area-inset-bottom));
+      min-height: 100px;
+      display: flex;
+      flex-direction: column;
+      justify-content: center;
+      gap: 8px;
+    }
+
+    #live-ja {
+      font-size: clamp(1.15rem, 4.5vw, 2rem);
+      font-weight: 700;
+      color: #fff;
+      line-height: 1.55;
+      text-align: center;
+    }
+
+    #live-en {
+      font-size: clamp(1rem, 4vw, 1.75rem);
+      color: var(--accent);
+      line-height: 1.5;
+      text-align: center;
+    }
+
+    #live-ja.dim, #live-en.dim { color: var(--text-dim); }
+
+    /* Tablet / desktop tweaks */
+    @media (min-width: 640px) {
+      #history { padding: 18px 24px; }
+      .card    { padding: 14px 18px; }
+    }
+
+    @media (min-width: 1024px) {
+      #history { max-width: 900px; width: 100%; margin: 0 auto; }
+      #live-bar { padding: 24px 10%; }
+    }
+  </style>
+</head>
+<body>
+
+  <header>
+    <h1>Live Captions &nbsp;·&nbsp; JA → EN</h1>
+    <div id="status">
+      <div id="dot"></div>
+      <span id="status-text">Connecting…</span>
+    </div>
+  </header>
+
+  <div id="history">
+    <p class="empty-msg">Captions will appear here once audio is detected.</p>
+  </div>
+
+  <div id="live-bar">
+    <div id="live-ja" class="dim">Listening…</div>
+    <div id="live-en" class="dim"></div>
+  </div>
+
+  <script>
+    const historyEl  = document.getElementById('history');
+    const liveJa     = document.getElementById('live-ja');
+    const liveEn     = document.getElementById('live-en');
+    const dot        = document.getElementById('dot');
+    const statusText = document.getElementById('status-text');
+
+    let lastOriginal   = '';
+    let reconnectDelay = 1000;  // ms, doubles on each failed attempt
+
+    /* ── Status helpers ─────────────────────────────────────────────────── */
+    function setStatus(state, label) {
+      dot.className   = state;  // '', 'ok', 'error'
+      statusText.textContent = label;
+    }
+
+    /* ── History card helpers ────────────────────────────────────────────── */
+    function addCard(original, translation) {
+      // Remove the empty placeholder if still showing
+      const ph = historyEl.querySelector('.empty-msg');
+      if (ph) ph.remove();
+
+      // Dim the previous latest card
+      const prev = historyEl.querySelector('.card.latest');
+      if (prev) prev.classList.remove('latest');
+
+      const card = document.createElement('div');
+      card.className = 'card latest';
+
+      const jaDiv = document.createElement('div');
+      jaDiv.className = 'card-ja';
+      jaDiv.textContent = original;
+
+      const enDiv = document.createElement('div');
+      enDiv.className = 'card-en';
+      enDiv.textContent = translation;
+
+      card.appendChild(jaDiv);
+      card.appendChild(enDiv);
+      historyEl.appendChild(card);
+      historyEl.scrollTop = historyEl.scrollHeight;
+
+      // Prune old cards to cap memory usage
+      const cards = historyEl.querySelectorAll('.card');
+      if (cards.length > 60) cards[0].remove();
+    }
+
+    function updateLatestCard(original, translation) {
+      const latest = historyEl.querySelector('.card.latest');
+      if (!latest) { addCard(original, translation); return; }
+      latest.querySelector('.card-ja').textContent = original;
+      latest.querySelector('.card-en').textContent = translation;
+    }
+
+    /* ── WebSocket ──────────────────────────────────────────────────────── */
+    function connect() {
+      const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+      const ws = new WebSocket(`${proto}://${location.host}/ws`);
+
+      ws.onopen = () => {
+        setStatus('ok', 'Connected');
+        reconnectDelay = 1000;
+        liveJa.textContent = 'Listening…';
+        liveJa.className = 'dim';
+        liveEn.textContent = '';
+        liveEn.className = 'dim';
+      };
+
+      ws.onmessage = ({ data }) => {
+        let msg;
+        try { msg = JSON.parse(data); } catch { return; }
+        const { original, translation } = msg;
+        if (!original) return;
+
+        // Update live subtitle bar
+        liveJa.textContent = original;
+        liveJa.className   = '';
+        liveEn.textContent = translation;
+        liveEn.className   = '';
+
+        // Update history: new card when phrase changes, in-place edit otherwise
+        if (original !== lastOriginal) {
+          addCard(original, translation);
+          lastOriginal = original;
+        } else {
+          updateLatestCard(original, translation);
+        }
+      };
+
+      ws.onerror = () => setStatus('error', 'Error');
+
+      ws.onclose = () => {
+        setStatus('error', `Reconnecting in ${Math.round(reconnectDelay / 1000)}s…`);
+        setTimeout(() => {
+          reconnectDelay = Math.min(reconnectDelay * 2, 30_000);
+          connect();
+        }, reconnectDelay);
+      };
+    }
+
+    connect();
+  </script>
+</body>
+</html>
