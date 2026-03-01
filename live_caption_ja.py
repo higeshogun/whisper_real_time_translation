@@ -28,7 +28,7 @@ Quick start
 import argparse
 import io
 import re
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from queue import Queue
 from sys import platform
 from tempfile import NamedTemporaryFile
@@ -70,8 +70,8 @@ def main():
     )
     parser.add_argument(
         "--device", default="auto",
-        choices=["auto", "cuda", "cpu"],
-        help="Compute device. (default: auto)",
+        choices=["auto", "cuda", "mps", "cpu"],
+        help="Compute device. 'mps' for Apple Silicon (uses CTranslate2 optimised CPU). (default: auto)",
     )
     parser.add_argument(
         "--compute_type", default="auto",
@@ -155,7 +155,9 @@ def main():
     model_size = "large-v2" if args.model == "large" else args.model
     # Japanese requires the multilingual model – never append ".en"
 
-    compute_type = "int8" if args.device == "cpu" else args.compute_type
+    # CTranslate2 doesn't support Metal/MPS; use optimised CPU on Apple Silicon
+    ct2_device   = "cpu" if args.device == "mps" else args.device
+    compute_type = "int8" if args.device in ("cpu", "mps") else args.compute_type
 
     nltk.download("punkt", quiet=True)
     nltk.download("punkt_tab", quiet=True)
@@ -163,7 +165,7 @@ def main():
     print(f"Loading Whisper model '{model_size}' …")
     audio_model = WhisperModel(
         model_size,
-        device=args.device,
+        device=ct2_device,
         compute_type=compute_type,
         cpu_threads=args.threads,
     )
@@ -195,7 +197,7 @@ def main():
 
     while True:
         try:
-            now = datetime.utcnow()
+            now = datetime.now(timezone.utc)
 
             if not data_queue.empty():
                 phrase_complete = False

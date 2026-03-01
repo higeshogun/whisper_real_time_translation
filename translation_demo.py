@@ -11,7 +11,7 @@ from nltk.tokenize import sent_tokenize
 
 
 
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from queue import Queue
 from tempfile import NamedTemporaryFile
 from time import sleep
@@ -126,7 +126,7 @@ def main():
 
     while True:
         try:
-            now = datetime.utcnow()
+            now = datetime.now(timezone.utc)
             # Pull raw recorded audio from the queue.
             if not data_queue.empty():
                 phrase_complete = False

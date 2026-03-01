@@ -51,7 +51,7 @@ import socket
 import sys
 import threading
 from contextlib import asynccontextmanager
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from queue import Empty, Queue
 from sys import platform
@@ -295,6 +295,8 @@ async def _broadcast_loop():
         except Exception:
             translation = ""
 
+        print(f"[server audio] [JA] {original}")
+        print(f"[server audio] [EN] {translation}\n")
         await _broadcast({"original": original, "translation": translation})
 
 
@@ -329,7 +331,7 @@ def _audio_loop(args: argparse.Namespace, source, model: WhisperModel) -> None:
 
     while True:
         try:
-            now = datetime.utcnow()
+            now = datetime.now(timezone.utc)
 
             if data_queue.empty():
                 sleep(0.25)
@@ -357,9 +359,15 @@ def _audio_loop(args: argparse.Namespace, source, model: WhisperModel) -> None:
                 beam_size=args.beam_size,
                 condition_on_previous_text=False,
                 vad_filter=True,
+                vad_parameters={"min_silence_duration_ms": 500},
+                no_speech_threshold=0.5,
+                log_prob_threshold=-0.5,
             )
             segments = list(segments_gen)
-            text = "".join(seg.text for seg in segments).strip()
+            text = "".join(
+                seg.text for seg in segments
+                if seg.no_speech_prob < 0.5
+            ).strip()
             if not text or _is_hallucination(segments, text):
                 continue
 
@@ -421,8 +429,8 @@ def _ensure_cert(ip: str) -> tuple[str, str]:
             .issuer_name(name)
             .public_key(private_key.public_key())
             .serial_number(x509.random_serial_number())
-            .not_valid_before(datetime.datetime.utcnow())
-            .not_valid_after(datetime.datetime.utcnow() + datetime.timedelta(days=365))
+            .not_valid_before(datetime.datetime.now(datetime.timezone.utc))
+            .not_valid_after(datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=365))
             .add_extension(x509.SubjectAlternativeName(san_entries), critical=False)
             .sign(private_key, hashes.SHA256())
         )
@@ -497,8 +505,9 @@ def _build_parser() -> argparse.ArgumentParser:
                    help="Beam search width. 1 = greedy (fastest, default). "
                         "5 = more accurate but ~2–3× slower.")
     p.add_argument("--device", default="auto",
-                   choices=["auto", "cuda", "cpu"],
-                   help="Compute device. 'cuda' works for both NVIDIA and AMD/ROCm. (default: auto)")
+                   choices=["auto", "cuda", "mps", "cpu"],
+                   help="Compute device. 'cuda' works for NVIDIA and AMD/ROCm. "
+                        "'mps' for Apple Silicon (uses CTranslate2 optimised CPU). (default: auto)")
     p.add_argument("--energy_threshold", default=300, type=int,
                    help="Audio sensitivity; lower = more sensitive (default: 300)")
     p.add_argument("--record_timeout", default=2, type=float,
@@ -566,22 +575,29 @@ def main() -> None:
     model_size = "large-v2" if args.model == "large" else args.model
 
     if args.device == "auto":
-        device = "cuda" if torch.cuda.is_available() else "cpu"
+        if torch.cuda.is_available():
+            device = "cuda"
+        elif torch.backends.mps.is_available():
+            device = "mps"
+        else:
+            device = "cpu"
     else:
         device = args.device
 
     nltk.download("punkt",     quiet=True)
     nltk.download("punkt_tab", quiet=True)
 
-    compute_type = "float16" if device == "cuda" else "int8"
+    # CTranslate2 doesn't support Metal/MPS; use optimised CPU on Apple Silicon
+    ct2_device   = "cpu" if device == "mps" else device
+    compute_type = "float16" if ct2_device == "cuda" else "int8"
     print(f"Loading Whisper '{model_size}' on {device} ({compute_type}) …")
     try:
-        _model = WhisperModel(model_size, device=device, compute_type=compute_type)
+        _model = WhisperModel(model_size, device=ct2_device, compute_type=compute_type)
     except RuntimeError as exc:
-        if device == "cuda":
+        if ct2_device == "cuda":
             print(f"[warning] CUDA init failed ({exc}); falling back to CPU.")
-            device, compute_type = "cpu", "int8"
-            _model = WhisperModel(model_size, device=device, compute_type=compute_type)
+            ct2_device, compute_type = "cpu", "int8"
+            _model = WhisperModel(model_size, device=ct2_device, compute_type=compute_type)
         else:
             raise
     print(f"Model loaded on: {device}")
