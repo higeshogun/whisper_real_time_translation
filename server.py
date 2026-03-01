@@ -56,8 +56,8 @@ from time import sleep
 
 import numpy as np
 import torch
-import whisper
 import nltk
+from faster_whisper import WhisperModel
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse
 from translatepy.translators.google import GoogleTranslate
@@ -74,7 +74,7 @@ def split_sentences(text: str) -> list[str]:
 
 # ── Module-level model + args (set in main, used by client-mic handler) ──────
 
-_model: whisper.Whisper | None = None
+_model: WhisperModel | None = None
 _args: argparse.Namespace | None = None
 
 # ── Shared state ──────────────────────────────────────────────────────────────
@@ -114,7 +114,7 @@ _HALLUCINATION_PHRASES: frozenset[str] = frozenset({
 })
 
 
-def _is_hallucination(result: dict, no_speech_threshold: float = 0.6) -> bool:
+def _is_hallucination(segments: list, text: str, no_speech_threshold: float = 0.6) -> bool:
     """
     Return True when the Whisper result should be discarded as a hallucination.
 
@@ -122,13 +122,9 @@ def _is_hallucination(result: dict, no_speech_threshold: float = 0.6) -> bool:
     • Every segment has a high no_speech_prob  (model itself doubts there is speech)
     • The full transcript exactly matches a known filler phrase
     """
-    segments = result.get("segments", [])
-    if segments and all(
-        seg.get("no_speech_prob", 0.0) > no_speech_threshold for seg in segments
-    ):
+    if segments and all(seg.no_speech_prob > no_speech_threshold for seg in segments):
         return True
-    text = result.get("text", "").strip().lower()
-    return text in _HALLUCINATION_PHRASES
+    return text.strip().lower() in _HALLUCINATION_PHRASES
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -181,15 +177,18 @@ async def _process_client_pcm(
 
     try:
         def _run_whisper():
-            result = _model.transcribe(
+            segments_gen, _ = _model.transcribe(
                 audio,
                 language=_args.source_lang,
-                beam_size=_args.beam_size if _args.beam_size > 1 else None,
+                beam_size=_args.beam_size,
                 condition_on_previous_text=False,
+                vad_filter=True,
             )
-            if _is_hallucination(result):
+            segments = list(segments_gen)
+            text = "".join(seg.text for seg in segments).strip()
+            if _is_hallucination(segments, text):
                 return ""
-            return result["text"].strip()
+            return text
 
         text = await asyncio.to_thread(_run_whisper)
     except Exception as exc:
@@ -297,9 +296,9 @@ async def _broadcast_loop():
 
 # ── Server-audio capture thread ───────────────────────────────────────────────
 
-def _audio_loop(args: argparse.Namespace, source, model: whisper.Whisper) -> None:
+def _audio_loop(args: argparse.Namespace, source, model: WhisperModel) -> None:
     """
-    Continuously capture audio, transcribe with OpenAI Whisper (forced to
+    Continuously capture audio, transcribe with faster-whisper (forced to
     Japanese), and put the latest sentence into _caption_queue for the async
     broadcast loop to pick up.
     """
@@ -348,16 +347,16 @@ def _audio_loop(args: argparse.Namespace, source, model: whisper.Whisper) -> Non
             with open(temp_file, "w+b") as f:
                 f.write(wav_bytes.read())
 
-            result = model.transcribe(
+            segments_gen, _ = model.transcribe(
                 temp_file,
                 language=args.source_lang,
-                beam_size=args.beam_size if args.beam_size > 1 else None,
+                beam_size=args.beam_size,
                 condition_on_previous_text=False,
+                vad_filter=True,
             )
-            if _is_hallucination(result):
-                continue
-            text = result["text"].strip()
-            if not text:
+            segments = list(segments_gen)
+            text = "".join(seg.text for seg in segments).strip()
+            if not text or _is_hallucination(segments, text):
                 continue
 
             if phrase_complete:
@@ -570,9 +569,10 @@ def main() -> None:
     nltk.download("punkt",     quiet=True)
     nltk.download("punkt_tab", quiet=True)
 
-    print(f"Loading Whisper '{model_size}' on {device} …")
-    _model = whisper.load_model(model_size, device=device)
-    print(f"Model loaded on: {next(_model.parameters()).device}")
+    compute_type = "float16" if device == "cuda" else "int8"
+    print(f"Loading Whisper '{model_size}' on {device} ({compute_type}) …")
+    _model = WhisperModel(model_size, device=device, compute_type=compute_type)
+    print(f"Model loaded on: {device}")
 
     # ── Start server-side audio thread (if not disabled) ─────────────────────
     if source is not None:

@@ -7,7 +7,7 @@ SpeechRecognition
 # For CPU-only remove the --extra-index-url line
 --extra-index-url https://download.pytorch.org/whl/rocm6.4
 torch
-openai-whisper
+faster-whisper
 translatepy
 tk
 nltk
