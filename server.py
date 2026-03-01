@@ -83,6 +83,54 @@ _caption_queue: Queue = Queue()   # server audio thread → async broadcast loop
 _clients: set[WebSocket] = set()  # all connected WebSocket clients
 
 
+# ── Hallucination filter ──────────────────────────────────────────────────────
+
+# Phrases Whisper commonly fabricates on silence / low-energy audio.
+# Checked case-insensitively after stripping punctuation/spaces.
+_HALLUCINATION_PHRASES: frozenset[str] = frozenset({
+    # Japanese
+    "ご視聴ありがとうございました",
+    "ご清聴ありがとうございました",
+    "ありがとうございました",
+    "お疲れ様でした",
+    "ご覧いただきありがとうございました",
+    "最後までご覧いただきありがとうございました",
+    "字幕は自動生成されました",
+    "字幕",
+    "翻訳",
+    "チャンネル登録よろしくお願いします",
+    "高評価をお願いします",
+    # English
+    "thank you for watching",
+    "thanks for watching",
+    "thank you for your hard work",
+    "thank you very much",
+    "please subscribe",
+    "like and subscribe",
+    "subtitles by",
+    "[music]",
+    "[applause]",
+    "[silence]",
+})
+
+
+def _is_hallucination(result: dict, no_speech_threshold: float = 0.6) -> bool:
+    """
+    Return True when the Whisper result should be discarded as a hallucination.
+
+    Two checks:
+    • Every segment has a high no_speech_prob  (model itself doubts there is speech)
+    • The full transcript exactly matches a known filler phrase
+    """
+    segments = result.get("segments", [])
+    if segments and all(
+        seg.get("no_speech_prob", 0.0) > no_speech_threshold for seg in segments
+    ):
+        return True
+    text = result.get("text", "").strip().lower()
+    return text in _HALLUCINATION_PHRASES
+
+
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 
@@ -139,6 +187,8 @@ async def _process_client_pcm(
                 beam_size=_args.beam_size if _args.beam_size > 1 else None,
                 condition_on_previous_text=False,
             )
+            if _is_hallucination(result):
+                return ""
             return result["text"].strip()
 
         text = await asyncio.to_thread(_run_whisper)
@@ -304,6 +354,8 @@ def _audio_loop(args: argparse.Namespace, source, model: whisper.Whisper) -> Non
                 beam_size=args.beam_size if args.beam_size > 1 else None,
                 condition_on_previous_text=False,
             )
+            if _is_hallucination(result):
+                continue
             text = result["text"].strip()
             if not text:
                 continue
