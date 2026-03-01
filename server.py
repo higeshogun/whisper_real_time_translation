@@ -331,24 +331,72 @@ def _audio_loop(args: argparse.Namespace, source, model: whisper.Whisper) -> Non
 
 def _ensure_cert(ip: str) -> tuple[str, str]:
     """
-    Generate a self-signed TLS certificate using openssl (if not already
-    present). Returns (cert_path, key_path).
+    Generate a self-signed TLS certificate (if not already present).
+    Tries the `cryptography` library first (no external tools needed),
+    then falls back to the openssl CLI. Returns (cert_path, key_path).
     """
-    import shutil
     cert, key = "server.crt", "server.key"
     if Path(cert).exists() and Path(key).exists():
         print("Using existing server.crt / server.key")
         return cert, key
 
+    # ── Try pure-Python generation via `cryptography` ────────────────────
+    try:
+        import datetime
+        import ipaddress
+        from cryptography import x509
+        from cryptography.hazmat.primitives import hashes, serialization
+        from cryptography.hazmat.primitives.asymmetric import rsa
+        from cryptography.x509.oid import NameOID
+
+        private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "Live Captions")])
+        san_entries = [
+            x509.DNSName("localhost"),
+            x509.IPAddress(ipaddress.IPv4Address("127.0.0.1")),
+        ]
+        try:
+            san_entries.insert(0, x509.IPAddress(ipaddress.IPv4Address(ip)))
+        except ValueError:
+            pass  # ip was a hostname, skip
+
+        certificate = (
+            x509.CertificateBuilder()
+            .subject_name(name)
+            .issuer_name(name)
+            .public_key(private_key.public_key())
+            .serial_number(x509.random_serial_number())
+            .not_valid_before(datetime.datetime.utcnow())
+            .not_valid_after(datetime.datetime.utcnow() + datetime.timedelta(days=365))
+            .add_extension(x509.SubjectAlternativeName(san_entries), critical=False)
+            .sign(private_key, hashes.SHA256())
+        )
+
+        Path(cert).write_bytes(certificate.public_bytes(serialization.Encoding.PEM))
+        Path(key).write_bytes(private_key.private_bytes(
+            serialization.Encoding.PEM,
+            serialization.PrivateFormat.TraditionalOpenSSL,
+            serialization.NoEncryption(),
+        ))
+        print(f"Generated {cert} and {key} (valid 365 days)")
+        return cert, key
+
+    except ImportError:
+        pass  # fall through to openssl CLI
+
+    # ── Fallback: openssl CLI ─────────────────────────────────────────────
+    import shutil
+    import subprocess
     if not shutil.which("openssl"):
         print(
-            "ERROR: 'openssl' not found. Install it, or manually create "
-            "server.crt and server.key and re-run without --https."
+            "ERROR: could not generate a TLS certificate.\n"
+            "  Install the 'cryptography' Python package:  pip install cryptography\n"
+            "  or install the openssl CLI tool and re-run.\n"
+            "  Alternatively, place server.crt and server.key next to server.py\n"
+            "  and re-run without --https."
         )
         sys.exit(1)
 
-    import subprocess
-    # Build a SAN extension so iOS/Android accept the cert for the LAN IP
     san = f"subjectAltName=IP:{ip},IP:127.0.0.1,DNS:localhost"
     subprocess.run(
         [
