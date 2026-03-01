@@ -43,8 +43,11 @@ import io
 import json
 import os
 import re
+
+# Windows: prevent crash when PyTorch (libiomp5md.dll) and CTranslate2
+# (libomp140.x86_64.dll) both try to initialise their own OpenMP runtime.
+os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
 import socket
-import struct
 import sys
 import threading
 from contextlib import asynccontextmanager
@@ -55,9 +58,10 @@ from sys import platform
 from tempfile import NamedTemporaryFile
 from time import sleep
 
+import numpy as np
 import torch
-import whisper
 import nltk
+from faster_whisper import WhisperModel
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse
 from translatepy.translators.google import GoogleTranslate
@@ -74,7 +78,7 @@ def split_sentences(text: str) -> list[str]:
 
 # ── Module-level model + args (set in main, used by client-mic handler) ──────
 
-_model: whisper.Whisper | None = None
+_model: WhisperModel | None = None
 _args: argparse.Namespace | None = None
 
 # ── Shared state ──────────────────────────────────────────────────────────────
@@ -83,23 +87,51 @@ _caption_queue: Queue = Queue()   # server audio thread → async broadcast loop
 _clients: set[WebSocket] = set()  # all connected WebSocket clients
 
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
+# ── Hallucination filter ──────────────────────────────────────────────────────
 
-def _pcm_to_wav(pcm: bytes, sample_rate: int = 16000) -> bytes:
-    """Wrap raw 16-bit mono PCM bytes in a minimal WAV container."""
-    channels, sample_width = 1, 2
-    data_size = len(pcm)
-    return struct.pack(
-        "<4sI4s4sIHHIIHH4sI",
-        b"RIFF", 36 + data_size, b"WAVE",
-        b"fmt ", 16,
-        1,                                          # PCM
-        channels, sample_rate,
-        sample_rate * channels * sample_width,      # byte rate
-        channels * sample_width,                    # block align
-        sample_width * 8,                           # bits per sample
-        b"data", data_size,
-    ) + pcm
+# Phrases Whisper commonly fabricates on silence / low-energy audio.
+# Checked case-insensitively after stripping punctuation/spaces.
+_HALLUCINATION_PHRASES: frozenset[str] = frozenset({
+    # Japanese
+    "ご視聴ありがとうございました",
+    "ご清聴ありがとうございました",
+    "ありがとうございました",
+    "お疲れ様でした",
+    "ご覧いただきありがとうございました",
+    "最後までご覧いただきありがとうございました",
+    "字幕は自動生成されました",
+    "字幕",
+    "翻訳",
+    "チャンネル登録よろしくお願いします",
+    "高評価をお願いします",
+    # English
+    "thank you for watching",
+    "thanks for watching",
+    "thank you for your hard work",
+    "thank you very much",
+    "please subscribe",
+    "like and subscribe",
+    "subtitles by",
+    "[music]",
+    "[applause]",
+    "[silence]",
+})
+
+
+def _is_hallucination(segments: list, text: str, no_speech_threshold: float = 0.6) -> bool:
+    """
+    Return True when the Whisper result should be discarded as a hallucination.
+
+    Two checks:
+    • Every segment has a high no_speech_prob  (model itself doubts there is speech)
+    • The full transcript exactly matches a known filler phrase
+    """
+    if segments and all(seg.no_speech_prob > no_speech_threshold for seg in segments):
+        return True
+    return text.strip().lower() in _HALLUCINATION_PHRASES
+
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
 
 
 async def _broadcast(data: dict) -> None:
@@ -143,31 +175,29 @@ async def _process_client_pcm(
     sample_rate: int,
     gtranslate: GoogleTranslate,
 ) -> None:
-    """Convert a PCM chunk to WAV, transcribe, translate, and broadcast."""
-    wav = _pcm_to_wav(pcm, sample_rate)
-    tmp = NamedTemporaryFile(suffix=".wav", delete=False)
-    tmp.write(wav)
-    tmp.close()
+    """Convert a PCM chunk to float32 and transcribe directly (no ffmpeg needed)."""
+    # 16-bit signed mono PCM → float32 in [-1, 1] (Whisper's native format)
+    audio = np.frombuffer(pcm, dtype=np.int16).astype(np.float32) / 32768.0
 
     try:
         def _run_whisper():
-            result = _model.transcribe(
-                tmp.name,
+            segments_gen, _ = _model.transcribe(
+                audio,
                 language=_args.source_lang,
-                beam_size=_args.beam_size if _args.beam_size > 1 else None,
+                beam_size=_args.beam_size,
                 condition_on_previous_text=False,
+                vad_filter=True,
             )
-            return result["text"].strip()
+            segments = list(segments_gen)
+            text = "".join(seg.text for seg in segments).strip()
+            if _is_hallucination(segments, text):
+                return ""
+            return text
 
         text = await asyncio.to_thread(_run_whisper)
     except Exception as exc:
         print(f"[client transcribe error] {exc}")
         return
-    finally:
-        try:
-            os.unlink(tmp.name)
-        except OSError:
-            pass
 
     if not text:
         return
@@ -270,9 +300,9 @@ async def _broadcast_loop():
 
 # ── Server-audio capture thread ───────────────────────────────────────────────
 
-def _audio_loop(args: argparse.Namespace, source, model: whisper.Whisper) -> None:
+def _audio_loop(args: argparse.Namespace, source, model: WhisperModel) -> None:
     """
-    Continuously capture audio, transcribe with OpenAI Whisper (forced to
+    Continuously capture audio, transcribe with faster-whisper (forced to
     Japanese), and put the latest sentence into _caption_queue for the async
     broadcast loop to pick up.
     """
@@ -321,14 +351,16 @@ def _audio_loop(args: argparse.Namespace, source, model: whisper.Whisper) -> Non
             with open(temp_file, "w+b") as f:
                 f.write(wav_bytes.read())
 
-            result = model.transcribe(
+            segments_gen, _ = model.transcribe(
                 temp_file,
                 language=args.source_lang,
-                beam_size=args.beam_size if args.beam_size > 1 else None,
+                beam_size=args.beam_size,
                 condition_on_previous_text=False,
+                vad_filter=True,
             )
-            text = result["text"].strip()
-            if not text:
+            segments = list(segments_gen)
+            text = "".join(seg.text for seg in segments).strip()
+            if not text or _is_hallucination(segments, text):
                 continue
 
             if phrase_complete:
@@ -354,24 +386,72 @@ def _audio_loop(args: argparse.Namespace, source, model: whisper.Whisper) -> Non
 
 def _ensure_cert(ip: str) -> tuple[str, str]:
     """
-    Generate a self-signed TLS certificate using openssl (if not already
-    present). Returns (cert_path, key_path).
+    Generate a self-signed TLS certificate (if not already present).
+    Tries the `cryptography` library first (no external tools needed),
+    then falls back to the openssl CLI. Returns (cert_path, key_path).
     """
-    import shutil
     cert, key = "server.crt", "server.key"
     if Path(cert).exists() and Path(key).exists():
         print("Using existing server.crt / server.key")
         return cert, key
 
+    # ── Try pure-Python generation via `cryptography` ────────────────────
+    try:
+        import datetime
+        import ipaddress
+        from cryptography import x509
+        from cryptography.hazmat.primitives import hashes, serialization
+        from cryptography.hazmat.primitives.asymmetric import rsa
+        from cryptography.x509.oid import NameOID
+
+        private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "Live Captions")])
+        san_entries = [
+            x509.DNSName("localhost"),
+            x509.IPAddress(ipaddress.IPv4Address("127.0.0.1")),
+        ]
+        try:
+            san_entries.insert(0, x509.IPAddress(ipaddress.IPv4Address(ip)))
+        except ValueError:
+            pass  # ip was a hostname, skip
+
+        certificate = (
+            x509.CertificateBuilder()
+            .subject_name(name)
+            .issuer_name(name)
+            .public_key(private_key.public_key())
+            .serial_number(x509.random_serial_number())
+            .not_valid_before(datetime.datetime.utcnow())
+            .not_valid_after(datetime.datetime.utcnow() + datetime.timedelta(days=365))
+            .add_extension(x509.SubjectAlternativeName(san_entries), critical=False)
+            .sign(private_key, hashes.SHA256())
+        )
+
+        Path(cert).write_bytes(certificate.public_bytes(serialization.Encoding.PEM))
+        Path(key).write_bytes(private_key.private_bytes(
+            serialization.Encoding.PEM,
+            serialization.PrivateFormat.TraditionalOpenSSL,
+            serialization.NoEncryption(),
+        ))
+        print(f"Generated {cert} and {key} (valid 365 days)")
+        return cert, key
+
+    except ImportError:
+        pass  # fall through to openssl CLI
+
+    # ── Fallback: openssl CLI ─────────────────────────────────────────────
+    import shutil
+    import subprocess
     if not shutil.which("openssl"):
         print(
-            "ERROR: 'openssl' not found. Install it, or manually create "
-            "server.crt and server.key and re-run without --https."
+            "ERROR: could not generate a TLS certificate.\n"
+            "  Install the 'cryptography' Python package:  pip install cryptography\n"
+            "  or install the openssl CLI tool and re-run.\n"
+            "  Alternatively, place server.crt and server.key next to server.py\n"
+            "  and re-run without --https."
         )
         sys.exit(1)
 
-    import subprocess
-    # Build a SAN extension so iOS/Android accept the cert for the LAN IP
     san = f"subjectAltName=IP:{ip},IP:127.0.0.1,DNS:localhost"
     subprocess.run(
         [
@@ -493,9 +573,18 @@ def main() -> None:
     nltk.download("punkt",     quiet=True)
     nltk.download("punkt_tab", quiet=True)
 
-    print(f"Loading Whisper '{model_size}' on {device} …")
-    _model = whisper.load_model(model_size, device=device)
-    print(f"Model loaded on: {next(_model.parameters()).device}")
+    compute_type = "float16" if device == "cuda" else "int8"
+    print(f"Loading Whisper '{model_size}' on {device} ({compute_type}) …")
+    try:
+        _model = WhisperModel(model_size, device=device, compute_type=compute_type)
+    except RuntimeError as exc:
+        if device == "cuda":
+            print(f"[warning] CUDA init failed ({exc}); falling back to CPU.")
+            device, compute_type = "cpu", "int8"
+            _model = WhisperModel(model_size, device=device, compute_type=compute_type)
+        else:
+            raise
+    print(f"Model loaded on: {device}")
 
     # ── Start server-side audio thread (if not disabled) ─────────────────────
     if source is not None:
