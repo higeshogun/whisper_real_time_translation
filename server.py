@@ -44,7 +44,6 @@ import json
 import os
 import re
 import socket
-import struct
 import sys
 import threading
 from contextlib import asynccontextmanager
@@ -55,6 +54,7 @@ from sys import platform
 from tempfile import NamedTemporaryFile
 from time import sleep
 
+import numpy as np
 import torch
 import whisper
 import nltk
@@ -84,22 +84,6 @@ _clients: set[WebSocket] = set()  # all connected WebSocket clients
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
-
-def _pcm_to_wav(pcm: bytes, sample_rate: int = 16000) -> bytes:
-    """Wrap raw 16-bit mono PCM bytes in a minimal WAV container."""
-    channels, sample_width = 1, 2
-    data_size = len(pcm)
-    return struct.pack(
-        "<4sI4s4sIHHIIHH4sI",
-        b"RIFF", 36 + data_size, b"WAVE",
-        b"fmt ", 16,
-        1,                                          # PCM
-        channels, sample_rate,
-        sample_rate * channels * sample_width,      # byte rate
-        channels * sample_width,                    # block align
-        sample_width * 8,                           # bits per sample
-        b"data", data_size,
-    ) + pcm
 
 
 async def _broadcast(data: dict) -> None:
@@ -143,16 +127,14 @@ async def _process_client_pcm(
     sample_rate: int,
     gtranslate: GoogleTranslate,
 ) -> None:
-    """Convert a PCM chunk to WAV, transcribe, translate, and broadcast."""
-    wav = _pcm_to_wav(pcm, sample_rate)
-    tmp = NamedTemporaryFile(suffix=".wav", delete=False)
-    tmp.write(wav)
-    tmp.close()
+    """Convert a PCM chunk to float32 and transcribe directly (no ffmpeg needed)."""
+    # 16-bit signed mono PCM → float32 in [-1, 1] (Whisper's native format)
+    audio = np.frombuffer(pcm, dtype=np.int16).astype(np.float32) / 32768.0
 
     try:
         def _run_whisper():
             result = _model.transcribe(
-                tmp.name,
+                audio,
                 language=_args.source_lang,
                 beam_size=_args.beam_size if _args.beam_size > 1 else None,
                 condition_on_previous_text=False,
@@ -163,11 +145,6 @@ async def _process_client_pcm(
     except Exception as exc:
         print(f"[client transcribe error] {exc}")
         return
-    finally:
-        try:
-            os.unlink(tmp.name)
-        except OSError:
-            pass
 
     if not text:
         return
