@@ -2,8 +2,11 @@
 server.py  –  Live Japanese caption web server
 
 Captures audio (mic or PulseAudio monitor for TV system audio), transcribes
-Japanese speech with Faster-Whisper, translates to English, and streams the
-results to every connected browser in real time via WebSocket.
+Japanese speech with OpenAI Whisper (PyTorch), translates to English, and
+streams the results to every connected browser in real time via WebSocket.
+
+AMD GPU (ROCm) is supported – PyTorch exposes ROCm under the same "cuda"
+device name, so --device cuda works on both NVIDIA and AMD cards.
 
 Clients can also stream audio FROM their phone/tablet mic through the browser
 (requires HTTPS – use --https to auto-generate a self-signed certificate).
@@ -27,7 +30,7 @@ Quick start
   # Larger model for better accuracy:
       python server.py --model large
 
-  # CPU-only:
+  # Force CPU:
       python server.py --device cpu
 
 Then open the URL printed in the terminal on any phone/tablet/browser on the
@@ -52,10 +55,11 @@ from sys import platform
 from tempfile import NamedTemporaryFile
 from time import sleep
 
+import torch
+import whisper
 import nltk
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse
-from faster_whisper import WhisperModel
 from translatepy.translators.google import GoogleTranslate
 
 # ── Sentence splitting (Japanese-aware) ──────────────────────────────────────
@@ -70,7 +74,7 @@ def split_sentences(text: str) -> list[str]:
 
 # ── Module-level model + args (set in main, used by client-mic handler) ──────
 
-_model: WhisperModel | None = None
+_model: whisper.Whisper | None = None
 _args: argparse.Namespace | None = None
 
 # ── Shared state ──────────────────────────────────────────────────────────────
@@ -147,15 +151,13 @@ async def _process_client_pcm(
 
     try:
         def _run_whisper():
-            segs, _ = _model.transcribe(
+            result = _model.transcribe(
                 tmp.name,
                 language=_args.source_lang,
-                beam_size=_args.beam_size,
+                beam_size=_args.beam_size if _args.beam_size > 1 else None,
                 condition_on_previous_text=False,
-                vad_filter=True,
-                vad_parameters={"min_silence_duration_ms": 300},
             )
-            return "".join(s.text for s in segs).strip()
+            return result["text"].strip()
 
         text = await asyncio.to_thread(_run_whisper)
     except Exception as exc:
@@ -268,9 +270,9 @@ async def _broadcast_loop():
 
 # ── Server-audio capture thread ───────────────────────────────────────────────
 
-def _audio_loop(args: argparse.Namespace, source, model: WhisperModel) -> None:
+def _audio_loop(args: argparse.Namespace, source, model: whisper.Whisper) -> None:
     """
-    Continuously capture audio, transcribe with Faster-Whisper (forced to
+    Continuously capture audio, transcribe with OpenAI Whisper (forced to
     Japanese), and put the latest sentence into _caption_queue for the async
     broadcast loop to pick up.
     """
@@ -319,15 +321,13 @@ def _audio_loop(args: argparse.Namespace, source, model: WhisperModel) -> None:
             with open(temp_file, "w+b") as f:
                 f.write(wav_bytes.read())
 
-            segments, _ = model.transcribe(
+            result = model.transcribe(
                 temp_file,
                 language=args.source_lang,
-                beam_size=args.beam_size,
+                beam_size=args.beam_size if args.beam_size > 1 else None,
                 condition_on_previous_text=False,
-                vad_filter=True,
-                vad_parameters={"min_silence_duration_ms": 500},
             )
-            text = "".join(seg.text for seg in segments).strip()
+            text = result["text"].strip()
             if not text:
                 continue
 
@@ -417,11 +417,8 @@ def _build_parser() -> argparse.ArgumentParser:
                    help="Beam search width. 1 = greedy (fastest, default). "
                         "5 = more accurate but ~2–3× slower.")
     p.add_argument("--device", default="auto",
-                   choices=["auto", "cuda", "cpu"])
-    p.add_argument("--compute_type", default="auto",
-                   choices=["auto", "int8", "int8_float16", "float16", "int16", "float32"])
-    p.add_argument("--threads", default=0, type=int,
-                   help="CPU inference threads; 0 = all cores (default: 0)")
+                   choices=["auto", "cuda", "cpu"],
+                   help="Compute device. 'cuda' works for both NVIDIA and AMD/ROCm. (default: auto)")
     p.add_argument("--energy_threshold", default=300, type=int,
                    help="Audio sensitivity; lower = more sensitive (default: 300)")
     p.add_argument("--record_timeout", default=2, type=float,
@@ -486,16 +483,19 @@ def main() -> None:
             source = sr.Microphone(sample_rate=16000)
 
     # ── Whisper model ─────────────────────────────────────────────────────────
-    model_size   = "large-v2" if args.model == "large" else args.model
-    compute_type = "int8" if args.device == "cpu" else args.compute_type
+    model_size = "large-v2" if args.model == "large" else args.model
+
+    if args.device == "auto":
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+    else:
+        device = args.device
 
     nltk.download("punkt",     quiet=True)
     nltk.download("punkt_tab", quiet=True)
 
-    print(f"Loading Whisper '{model_size}' …")
-    _model = WhisperModel(model_size, device=args.device,
-                          compute_type=compute_type,
-                          cpu_threads=args.threads)
+    print(f"Loading Whisper '{model_size}' on {device} …")
+    _model = whisper.load_model(model_size, device=device)
+    print(f"Model loaded on: {next(_model.parameters()).device}")
 
     # ── Start server-side audio thread (if not disabled) ─────────────────────
     if source is not None:

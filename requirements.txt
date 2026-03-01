@@ -1,10 +1,13 @@
 # Only needed for server-side audio capture (not required for --no_server_audio mode)
 pyaudio
 SpeechRecognition
-# PyTorch – remove the index URL below if you want CPU-only or a different CUDA version
---extra-index-url https://download.pytorch.org/whl/cu116
+# PyTorch with ROCm (AMD GPU) – replace rocm6.2 with your ROCm version if different
+# Find your version with: rocminfo | grep "ROCm"
+# For NVIDIA CUDA use:  --extra-index-url https://download.pytorch.org/whl/cu121
+# For CPU-only remove the --extra-index-url line
+--extra-index-url https://download.pytorch.org/whl/rocm6.2
 torch
-faster-whisper
+openai-whisper
 translatepy
 tk
 nltk
