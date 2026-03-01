@@ -43,6 +43,10 @@ import io
 import json
 import os
 import re
+
+# Windows: prevent crash when PyTorch (libiomp5md.dll) and CTranslate2
+# (libomp140.x86_64.dll) both try to initialise their own OpenMP runtime.
+os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
 import socket
 import sys
 import threading
