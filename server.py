@@ -295,6 +295,8 @@ async def _broadcast_loop():
         except Exception:
             translation = ""
 
+        print(f"[server audio] [JA] {original}")
+        print(f"[server audio] [EN] {translation}\n")
         await _broadcast({"original": original, "translation": translation})
 
 
@@ -357,9 +359,15 @@ def _audio_loop(args: argparse.Namespace, source, model: WhisperModel) -> None:
                 beam_size=args.beam_size,
                 condition_on_previous_text=False,
                 vad_filter=True,
+                vad_parameters={"min_silence_duration_ms": 500},
+                no_speech_threshold=0.5,
+                log_prob_threshold=-0.5,
             )
             segments = list(segments_gen)
-            text = "".join(seg.text for seg in segments).strip()
+            text = "".join(
+                seg.text for seg in segments
+                if seg.no_speech_prob < 0.5
+            ).strip()
             if not text or _is_hallucination(segments, text):
                 continue
 
