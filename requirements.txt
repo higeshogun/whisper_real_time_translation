@@ -5,7 +5,7 @@ SpeechRecognition
 # Find your version with: rocminfo | grep "ROCm"
 # For NVIDIA CUDA use:  --extra-index-url https://download.pytorch.org/whl/cu121
 # For CPU-only remove the --extra-index-url line
---extra-index-url https://download.pytorch.org/whl/rocm6.3
+--extra-index-url https://download.pytorch.org/whl/rocm6.4
 torch
 openai-whisper
 translatepy
