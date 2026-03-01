@@ -221,8 +221,14 @@ def main():
                     language=args.source_lang,
                     vad_filter=True,
                     vad_parameters={"min_silence_duration_ms": 500},
+                    condition_on_previous_text=False,
+                    no_speech_threshold=0.5,
+                    log_prob_threshold=-0.5,
                 )
-                text = "".join(seg.text for seg in segments).strip()
+                text = "".join(
+                    seg.text for seg in segments
+                    if seg.no_speech_prob < 0.5
+                ).strip()
 
                 if phrase_complete:
                     transcription.append(text)
