@@ -505,8 +505,9 @@ def _build_parser() -> argparse.ArgumentParser:
                    help="Beam search width. 1 = greedy (fastest, default). "
                         "5 = more accurate but ~2–3× slower.")
     p.add_argument("--device", default="auto",
-                   choices=["auto", "cuda", "cpu"],
-                   help="Compute device. 'cuda' works for both NVIDIA and AMD/ROCm. (default: auto)")
+                   choices=["auto", "cuda", "mps", "cpu"],
+                   help="Compute device. 'cuda' works for NVIDIA and AMD/ROCm. "
+                        "'mps' for Apple Silicon (uses CTranslate2 optimised CPU). (default: auto)")
     p.add_argument("--energy_threshold", default=300, type=int,
                    help="Audio sensitivity; lower = more sensitive (default: 300)")
     p.add_argument("--record_timeout", default=2, type=float,
@@ -574,22 +575,29 @@ def main() -> None:
     model_size = "large-v2" if args.model == "large" else args.model
 
     if args.device == "auto":
-        device = "cuda" if torch.cuda.is_available() else "cpu"
+        if torch.cuda.is_available():
+            device = "cuda"
+        elif torch.backends.mps.is_available():
+            device = "mps"
+        else:
+            device = "cpu"
     else:
         device = args.device
 
     nltk.download("punkt",     quiet=True)
     nltk.download("punkt_tab", quiet=True)
 
-    compute_type = "float16" if device == "cuda" else "int8"
+    # CTranslate2 doesn't support Metal/MPS; use optimised CPU on Apple Silicon
+    ct2_device   = "cpu" if device == "mps" else device
+    compute_type = "float16" if ct2_device == "cuda" else "int8"
     print(f"Loading Whisper '{model_size}' on {device} ({compute_type}) …")
     try:
-        _model = WhisperModel(model_size, device=device, compute_type=compute_type)
+        _model = WhisperModel(model_size, device=ct2_device, compute_type=compute_type)
     except RuntimeError as exc:
-        if device == "cuda":
+        if ct2_device == "cuda":
             print(f"[warning] CUDA init failed ({exc}); falling back to CPU.")
-            device, compute_type = "cpu", "int8"
-            _model = WhisperModel(model_size, device=device, compute_type=compute_type)
+            ct2_device, compute_type = "cpu", "int8"
+            _model = WhisperModel(model_size, device=ct2_device, compute_type=compute_type)
         else:
             raise
     print(f"Model loaded on: {device}")
