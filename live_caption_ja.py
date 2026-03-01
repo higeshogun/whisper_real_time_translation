@@ -28,7 +28,7 @@ Quick start
 import argparse
 import io
 import re
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from queue import Queue
 from sys import platform
 from tempfile import NamedTemporaryFile
@@ -195,7 +195,7 @@ def main():
 
     while True:
         try:
-            now = datetime.utcnow()
+            now = datetime.now(timezone.utc)
 
             if not data_queue.empty():
                 phrase_complete = False

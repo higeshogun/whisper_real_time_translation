@@ -51,7 +51,7 @@ import socket
 import sys
 import threading
 from contextlib import asynccontextmanager
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from queue import Empty, Queue
 from sys import platform
@@ -331,7 +331,7 @@ def _audio_loop(args: argparse.Namespace, source, model: WhisperModel) -> None:
 
     while True:
         try:
-            now = datetime.utcnow()
+            now = datetime.now(timezone.utc)
 
             if data_queue.empty():
                 sleep(0.25)
@@ -429,8 +429,8 @@ def _ensure_cert(ip: str) -> tuple[str, str]:
             .issuer_name(name)
             .public_key(private_key.public_key())
             .serial_number(x509.random_serial_number())
-            .not_valid_before(datetime.datetime.utcnow())
-            .not_valid_after(datetime.datetime.utcnow() + datetime.timedelta(days=365))
+            .not_valid_before(datetime.datetime.now(datetime.timezone.utc))
+            .not_valid_after(datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=365))
             .add_extension(x509.SubjectAlternativeName(san_entries), critical=False)
             .sign(private_key, hashes.SHA256())
         )
