@@ -575,7 +575,15 @@ def main() -> None:
 
     compute_type = "float16" if device == "cuda" else "int8"
     print(f"Loading Whisper '{model_size}' on {device} ({compute_type}) …")
-    _model = WhisperModel(model_size, device=device, compute_type=compute_type)
+    try:
+        _model = WhisperModel(model_size, device=device, compute_type=compute_type)
+    except RuntimeError as exc:
+        if device == "cuda":
+            print(f"[warning] CUDA init failed ({exc}); falling back to CPU.")
+            device, compute_type = "cpu", "int8"
+            _model = WhisperModel(model_size, device=device, compute_type=compute_type)
+        else:
+            raise
     print(f"Model loaded on: {device}")
 
     # ── Start server-side audio thread (if not disabled) ─────────────────────
